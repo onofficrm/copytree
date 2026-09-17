@@ -13,16 +13,11 @@ concurrency:
 jobs:
   purge-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install lftp
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lftp
 
       - name: Purge malware and upload clean static site
         env:
@@ -31,110 +26,225 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_PORT: ${{ secrets.FTP_PORT }}
         run: |
-          set -euo pipefail
-          FTP_PORT="${FTP_PORT:-21}"
-          FTP_SERVER="${FTP_SERVER#ftp://}"
-          FTP_SERVER="${FTP_SERVER#ftps://}"
-          FTP_SERVER="${FTP_SERVER#sftp://}"
-          FTP_SERVER="${FTP_SERVER%/}"
+          python3 <<'PY'
+          import ftplib
+          import os
+          import time
+          from pathlib import Path
 
-          lftp_cmd() {
-            lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<EOF
-          set ftp:passive-mode true
-          set ssl:verify-certificate no
-          set sftp:auto-confirm yes
-          set net:max-retries 4
-          set net:timeout 45
-          set net:reconnect-interval-base 5
-          set cmd:fail-exit no
-          $1
-          bye
-          EOF
-          }
+          raw_host = os.environ["FTP_SERVER"].strip()
+          for prefix in ("ftp://", "ftps://", "sftp://"):
+              if raw_host.startswith(prefix):
+                  raw_host = raw_host[len(prefix):]
+          host = raw_host.split("/")[0]
+          user = os.environ["FTP_USERNAME"]
+          password = os.environ["FTP_PASSWORD"]
+          port = int(os.environ.get("FTP_PORT") or "21")
 
-          ROOT_LIST=$(lftp_cmd "cls -1")
-          echo "FTP root:"
-          echo "$ROOT_LIST"
+          SKIP_NAMES = {".", ".."}
+          EXEC_EXT = (
+              ".php", ".phtml", ".phar", ".php3", ".php4", ".php5", ".php7",
+              ".cgi", ".pl", ".asp", ".aspx", ".jsp", ".suspected",
+          )
+          EXEC_NAMES = {".user.ini", "user.ini", ".php.ini", "php.ini"}
+          LOCAL_ROOT = Path(".")
+          LOCAL_FILES = [
+              "index.html", "rehab.html", "bankruptcy.html", "process.html",
+              "faq.html", "consult.html", "privacy.html", ".htaccess",
+          ]
+          LOCAL_DIRS = ["css", "js"]
 
-          REMOTE_DIR="."
-          if echo "$ROOT_LIST" | grep -qx "public_html"; then
-            REMOTE_DIR="public_html"
-          elif echo "$ROOT_LIST" | grep -qx "www"; then
-            REMOTE_DIR="www"
-          elif echo "$ROOT_LIST" | grep -qx "httpdocs"; then
-            REMOTE_DIR="httpdocs"
-          fi
-          echo "Using remote directory: $REMOTE_DIR"
+          deleted = 0
+          ftp = None
 
-          echo "Purging known malware loaders and leftover CMS trees"
-          lftp_cmd "
-          cd $REMOTE_DIR
-          glob -a rm -f .user.ini .php.ini user.ini php.ini
-          glob -a rm -f *.php *.phtml *.php3 *.php4 *.php5 *.php7 *.phar *.cgi *.pl *.asp *.aspx *.jsp
-          glob -a rm -rf wp-admin wp-includes wp-content wordpress wp
-          glob -a rm -rf gnuboard gnu board data cache session tmp cgi-bin vendor
-          glob -a rm -rf old backup bak _backup _backup_transfer_
-          "
+          def connect():
+              client = ftplib.FTP()
+              client.connect(host, port, timeout=90)
+              client.login(user, password)
+              client.set_pasv(True)
+              client.encoding = "latin-1"
+              return client
 
-          KEEP='^(index.html|rehab.html|bankruptcy.html|process.html|faq.html|consult.html|privacy.html|css|js|\.htaccess)$'
-          TOP=$(lftp_cmd "cd $REMOTE_DIR; cls -1a")
-          echo "Top-level before extra purge:"
-          echo "$TOP"
+          def ensure():
+              global ftp
+              try:
+                  ftp.voidcmd("NOOP")
+                  return ftp
+              except Exception:
+                  print("reconnect", flush=True)
+                  time.sleep(2)
+                  ftp = connect()
+                  return ftp
 
-          echo "$TOP" | while IFS= read -r name; do
-            [ -z "$name" ] && continue
-            case "$name" in
-              .|..) continue ;;
-            esac
-            if echo "$name" | grep -Eq "$KEEP"; then
-              echo "KEEP $name"
-              continue
-            fi
-            echo "PURGE $name"
-            lftp_cmd "cd $REMOTE_DIR; glob -a rm -rf \"$name\""
-          done
+          def retry(fn, tries=6):
+              last = None
+              for i in range(tries):
+                  try:
+                      ensure()
+                      return fn()
+                  except Exception as e:
+                      last = e
+                      print(f"retry {i+1}: {e}", flush=True)
+                      time.sleep(2 + i)
+                      try:
+                          ftp.close()
+                      except Exception:
+                          pass
+                      globals()["ftp"] = connect()
+              raise last
 
-          echo "Deleting leftover executable files"
-          FIND=$(lftp_cmd "cd $REMOTE_DIR; find")
-          echo "$FIND" | grep -Ei '\.(php|phtml|php[0-9]|phar|cgi|pl|asp|aspx|jsp)$|(^|/)\.user\.ini$|(^|/)user\.ini$' | while IFS= read -r path; do
-            [ -z "$path" ] && continue
-            echo "DELETE $path"
-            lftp_cmd "cd $REMOTE_DIR; rm -f \"$path\""
-          done
+          def enter_webroot():
+              for path in ("/public_html", "public_html"):
+                  try:
+                      ftp.cwd(path)
+                      print(f"webroot={ftp.pwd()}", flush=True)
+                      return
+                  except Exception as e:
+                      print(f"skip {path}: {e}", flush=True)
+              raise SystemExit("public_html not found; refusing to wipe FTP home")
 
-          STAGE="$(mktemp -d)"
-          cp -a index.html rehab.html bankruptcy.html process.html faq.html consult.html privacy.html .htaccess "$STAGE/"
-          cp -a css js "$STAGE/"
+          def list_entries():
+              items = []
+              try:
+                  for name, facts in ftp.mlsd():
+                      if name in SKIP_NAMES:
+                          continue
+                      items.append((name, facts.get("type") == "dir"))
+                  return items
+              except Exception:
+                  pass
+              lines = []
+              ftp.retrlines("LIST", lines.append)
+              for line in lines:
+                  parts = line.split(maxsplit=8)
+                  if len(parts) < 9:
+                      continue
+                  name = parts[8]
+                  if name in SKIP_NAMES:
+                      continue
+                  items.append((name, line.startswith("d")))
+              return items
 
-          echo "Uploading clean static site"
-          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<EOF
-          set ftp:passive-mode true
-          set ssl:verify-certificate no
-          set sftp:auto-confirm yes
-          set net:max-retries 4
-          set net:timeout 45
-          set xfer:clobber true
-          set cmd:fail-exit yes
-          cd $REMOTE_DIR
-          lcd $STAGE
-          mirror --reverse --delete --verbose --parallel=2 \
-            --exclude-glob .git/ \
-            --exclude-glob .github/ \
-            --exclude-glob .gitignore \
-            --exclude-glob README.md \
-            --exclude-glob .DS_Store \
-            ./ .
-          bye
-          EOF
+          def delete_file(name):
+              global deleted
+              ftp.delete(name)
+              deleted += 1
+              if deleted % 50 == 0:
+                  print(f"deleted {deleted} items", flush=True)
 
-          echo "Final remote listing"
-          FINAL=$(lftp_cmd "cd $REMOTE_DIR; find")
-          echo "$FINAL"
+          def delete_tree(path):
+              def work():
+                  ftp.cwd(path)
+                  for name, is_dir in list_entries():
+                      child = path.rstrip("/") + "/" + name
+                      if is_dir:
+                          delete_tree(child)
+                      else:
+                          def rm():
+                              ftp.cwd(path)
+                              delete_file(name)
+                          retry(rm)
+                  parent = path.rsplit("/", 1)[0] or "/"
+                  base = path.rstrip("/").split("/")[-1]
+                  ftp.cwd(parent)
+                  ftp.rmd(base)
+                  print(f"removed dir {path}", flush=True)
+              retry(work)
 
-          LEFT=$(echo "$FINAL" | grep -Ei '\.(php|phtml|php[0-9]|phar|cgi|pl|asp|aspx|jsp)$|(^|/)\.user\.ini$|(^|/)user\.ini$' || true)
-          if [ -n "$LEFT" ]; then
-            echo "Malware leftovers remain:"
-            echo "$LEFT"
-            exit 1
-          fi
-          echo "No PHP/webshell leftovers found."
+          def is_exec(name, is_dir):
+              lower = name.lower()
+              if is_dir:
+                  return False
+              if lower in EXEC_NAMES:
+                  return True
+              return lower.endswith(EXEC_EXT) or lower.endswith(".php.bak") or lower.endswith(".php.old")
+
+          ftp = connect()
+          print(f"connected host={host} port={port}", flush=True)
+          enter_webroot()
+          webroot = ftp.pwd()
+
+          print("=== wipe public_html ===", flush=True)
+          top = retry(list_entries)
+          print("top-level: " + ", ".join(name for name, _ in top), flush=True)
+          for name, is_dir in top:
+              target = webroot.rstrip("/") + "/" + name
+              print(f"purge {'dir' if is_dir else 'file'} {name}", flush=True)
+              if is_dir:
+                  delete_tree(target)
+              else:
+                  def rm_top():
+                      ftp.cwd(webroot)
+                      delete_file(name)
+                  retry(rm_top)
+
+          print(f"wipe done deleted={deleted}", flush=True)
+
+          print("=== upload clean site ===", flush=True)
+          def upload_file(local: Path, remote_dir: str, remote_name: str):
+              def put():
+                  ftp.cwd(remote_dir)
+                  with local.open("rb") as fh:
+                      ftp.storbinary(f"STOR {remote_name}", fh)
+                  print(f"uploaded {remote_dir.rstrip('/')}/{remote_name}", flush=True)
+              retry(put)
+
+          def ensure_dir(remote_dir: str):
+              def mk():
+                  parent, base = remote_dir.rsplit("/", 1) if "/" in remote_dir.rstrip("/") else ("/", remote_dir.strip("/"))
+                  if not base:
+                      return
+                  try:
+                      ftp.cwd(remote_dir)
+                  except Exception:
+                      ftp.cwd(parent or webroot)
+                      try:
+                          ftp.mkd(base)
+                      except Exception:
+                          pass
+                      ftp.cwd(remote_dir)
+              retry(mk)
+
+          ftp.cwd(webroot)
+          for name in LOCAL_FILES:
+              upload_file(LOCAL_ROOT / name, webroot, name)
+          for dirname in LOCAL_DIRS:
+              remote_dir = webroot.rstrip("/") + "/" + dirname
+              ensure_dir(remote_dir)
+              local_dir = LOCAL_ROOT / dirname
+              for path in local_dir.rglob("*"):
+                  rel = path.relative_to(local_dir).as_posix()
+                  if path.is_dir():
+                      ensure_dir(remote_dir + "/" + rel)
+                  else:
+                      parent = str(Path(rel).parent)
+                      dest = remote_dir if parent == "." else remote_dir + "/" + parent
+                      upload_file(path, dest, path.name)
+
+          print("=== verify ===", flush=True)
+          leftovers = []
+
+          def walk(path, depth=0):
+              if depth > 20:
+                  return
+              def listing():
+                  ftp.cwd(path)
+                  return list_entries()
+              for name, is_dir in retry(listing):
+                  child = path.rstrip("/") + "/" + name
+                  if is_exec(name, is_dir):
+                      leftovers.append(child)
+                      continue
+                  if is_dir:
+                      walk(child, depth + 1)
+
+          walk(webroot)
+          print("remaining executables: " + (", ".join(leftovers) if leftovers else "none"), flush=True)
+          try:
+              ftp.quit()
+          except Exception:
+              pass
+          if leftovers:
+              raise SystemExit("malware leftovers remain")
+          print("VERIFY OK: public_html has no PHP/webshell leftovers", flush=True)
+          PY

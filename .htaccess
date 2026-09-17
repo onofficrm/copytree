@@ -1,6 +1,18 @@
 DirectoryIndex index.html
 AddDefaultCharset UTF-8
 
+<IfModule mod_authz_core.c>
+  <FilesMatch "\.(php|phtml|phar|php[0-9]|cgi|pl)$">
+    Require all denied
+  </FilesMatch>
+</IfModule>
+<IfModule !mod_authz_core.c>
+  <FilesMatch "\.(php|phtml|phar|php[0-9]|cgi|pl)$">
+    Order allow,deny
+    Deny from all
+  </FilesMatch>
+</IfModule>
+
 <IfModule mod_deflate.c>
   AddOutputFilterByType DEFLATE text/html text/css text/javascript application/javascript
 </IfModule>
