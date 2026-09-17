@@ -5,7 +5,9 @@ Thumbs.db
 .env.*
 .vscode/
 .idea/
-data/
-cache/
-session/
-tmp/
+/data/
+/cache/
+/session/
+/tmp/
+webapp/node_modules/
+webapp/dist/

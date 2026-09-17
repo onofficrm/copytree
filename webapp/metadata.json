@@ -1,0 +1,8 @@
+{
+  "name": "창원개인회생",
+  "description": "창원개인회생 전문 1:1 비공개 안심 법률상담 및 1분 자가진단",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
