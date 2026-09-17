@@ -98,7 +98,7 @@ export const HomeHeroSection: React.FC<HomeHeroSectionProps> = ({
               {/* Image Container with Elegant Rounded Frame & Soft Border */}
               <div className="relative rounded-3xl overflow-hidden border border-[#2D3C5A] shadow-2xl bg-[#1C2538]">
                 <img
-                  src="/src/assets/images/counseling_hero_1789524227384.jpg"
+                  src="/images/counseling_hero.jpg"
                   alt="신뢰감 있는 법률사무소 1:1 창원개인회생 전문 상담 모습"
                   referrerPolicy="no-referrer"
                   className="w-full h-[320px] sm:h-[380px] lg:h-[420px] object-cover object-center group-hover:scale-102 transition-transform duration-500"
