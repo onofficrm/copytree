@@ -11,40 +11,130 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ftp-deploy:
+  purge-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy via FTP
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server: ${{ secrets.FTP_SERVER }}
-          username: ${{ secrets.FTP_USERNAME }}
-          password: ${{ secrets.FTP_PASSWORD }}
-          port: ${{ secrets.FTP_PORT }}
-          parallel: 1
-          protocol: ftp
-          local-dir: ./
-          server-dir: /public_html/
-          dangerous-clean-slate: true
-          state-name: copytree-deploy-v1
-          log-level: standard
-          exclude: |
-            **/.git*
-            **/.github/**
-            **/.DS_Store
-            **/.vscode/**
-            **/._*
-            README.md
-            _backup_transfer_*/
-            **/_backup_transfer_*/
-            data/**
-            cache/**
-            session/**
-            tmp/**
-            *.log
-            .env
-            .env.*
+      - name: Install lftp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lftp
+
+      - name: Purge malware and upload clean static site
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+        run: |
+          set -euo pipefail
+          FTP_PORT="${FTP_PORT:-21}"
+          FTP_SERVER="${FTP_SERVER#ftp://}"
+          FTP_SERVER="${FTP_SERVER#ftps://}"
+          FTP_SERVER="${FTP_SERVER#sftp://}"
+          FTP_SERVER="${FTP_SERVER%/}"
+
+          lftp_cmd() {
+            lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<EOF
+          set ftp:passive-mode true
+          set ssl:verify-certificate no
+          set sftp:auto-confirm yes
+          set net:max-retries 4
+          set net:timeout 45
+          set net:reconnect-interval-base 5
+          set cmd:fail-exit no
+          $1
+          bye
+          EOF
+          }
+
+          ROOT_LIST=$(lftp_cmd "cls -1")
+          echo "FTP root:"
+          echo "$ROOT_LIST"
+
+          REMOTE_DIR="."
+          if echo "$ROOT_LIST" | grep -qx "public_html"; then
+            REMOTE_DIR="public_html"
+          elif echo "$ROOT_LIST" | grep -qx "www"; then
+            REMOTE_DIR="www"
+          elif echo "$ROOT_LIST" | grep -qx "httpdocs"; then
+            REMOTE_DIR="httpdocs"
+          fi
+          echo "Using remote directory: $REMOTE_DIR"
+
+          echo "Purging known malware loaders and leftover CMS trees"
+          lftp_cmd "
+          cd $REMOTE_DIR
+          glob -a rm -f .user.ini .php.ini user.ini php.ini
+          glob -a rm -f *.php *.phtml *.php3 *.php4 *.php5 *.php7 *.phar *.cgi *.pl *.asp *.aspx *.jsp
+          glob -a rm -rf wp-admin wp-includes wp-content wordpress wp
+          glob -a rm -rf gnuboard gnu board data cache session tmp cgi-bin vendor
+          glob -a rm -rf old backup bak _backup _backup_transfer_
+          "
+
+          KEEP='^(index.html|rehab.html|bankruptcy.html|process.html|faq.html|consult.html|privacy.html|css|js|\.htaccess)$'
+          TOP=$(lftp_cmd "cd $REMOTE_DIR; cls -1a")
+          echo "Top-level before extra purge:"
+          echo "$TOP"
+
+          echo "$TOP" | while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            case "$name" in
+              .|..) continue ;;
+            esac
+            if echo "$name" | grep -Eq "$KEEP"; then
+              echo "KEEP $name"
+              continue
+            fi
+            echo "PURGE $name"
+            lftp_cmd "cd $REMOTE_DIR; glob -a rm -rf \"$name\""
+          done
+
+          echo "Deleting leftover executable files"
+          FIND=$(lftp_cmd "cd $REMOTE_DIR; find")
+          echo "$FIND" | grep -Ei '\.(php|phtml|php[0-9]|phar|cgi|pl|asp|aspx|jsp)$|(^|/)\.user\.ini$|(^|/)user\.ini$' | while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            echo "DELETE $path"
+            lftp_cmd "cd $REMOTE_DIR; rm -f \"$path\""
+          done
+
+          STAGE="$(mktemp -d)"
+          cp -a index.html rehab.html bankruptcy.html process.html faq.html consult.html privacy.html .htaccess "$STAGE/"
+          cp -a css js "$STAGE/"
+
+          echo "Uploading clean static site"
+          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<EOF
+          set ftp:passive-mode true
+          set ssl:verify-certificate no
+          set sftp:auto-confirm yes
+          set net:max-retries 4
+          set net:timeout 45
+          set xfer:clobber true
+          set cmd:fail-exit yes
+          cd $REMOTE_DIR
+          lcd $STAGE
+          mirror --reverse --delete --verbose --parallel=2 \
+            --exclude-glob .git/ \
+            --exclude-glob .github/ \
+            --exclude-glob .gitignore \
+            --exclude-glob README.md \
+            --exclude-glob .DS_Store \
+            ./ .
+          bye
+          EOF
+
+          echo "Final remote listing"
+          FINAL=$(lftp_cmd "cd $REMOTE_DIR; find")
+          echo "$FINAL"
+
+          LEFT=$(echo "$FINAL" | grep -Ei '\.(php|phtml|php[0-9]|phar|cgi|pl|asp|aspx|jsp)$|(^|/)\.user\.ini$|(^|/)user\.ini$' || true)
+          if [ -n "$LEFT" ]; then
+            echo "Malware leftovers remain:"
+            echo "$LEFT"
+            exit 1
+          fi
+          echo "No PHP/webshell leftovers found."
